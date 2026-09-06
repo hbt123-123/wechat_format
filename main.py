@@ -1,309 +1,488 @@
-import json
-import pandas as pd
-from datetime import datetime
-import jieba
-from collections import Counter
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+微信聊天记录分析工具（单文件版）
+
+输入一个 chatlog API URL，自动完成：数据下载 → 格式化 → 全量统计 → 生成心理测评任务包。
+
+用法：
+    python main.py <URL或本地JSON文件路径> [-o 输出目录]
+
+示例：
+    python main.py "http://127.0.0.1:5030/api/v1/chatlog?limit=100000"
+
+输出（默认在 ./output 下）：
+    chat_format.json       格式化后的聊天记录
+    chat_analysis.xlsx     全量统计结果（语音电话、常用词、消息趋势等）
+    assessment_tasks.json  心理测评任务包（供子智能体执行，包内含完整提示词与聊天记录）
+    run_summary.json       运行摘要（各阶段状态与统计概要，供主智能体监测统计过程）
+
+智能体协作说明：
+    本脚本作为"统计工具"由主智能体调用并监测；心理测评由主智能体派发的子智能体
+    读取 assessment_tasks.json 中的任务包完成（不再由脚本直接调用 LLM API）。
+"""
+
+import argparse
 import calendar
-import sys
+import json
 import os
-from openai import OpenAI
-from openai import RateLimitError
-import time
+import re
+import sys
+from collections import Counter
+from datetime import datetime
 
-def read_chat_history(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    return data
+import jieba
+import pandas as pd
+import requests
 
-def format_chat_json(input_file, output_file):
-    try:
-        with open(input_file, "r", encoding="utf-8") as f:
-            messages = json.load(f)
-        
-        optimized_messages = []
-        
-        for msg in messages:
-            time_str = msg.get("time", "")
-            formatted_time = ""
-            if time_str:
-                try:
-                    dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-                    formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    formatted_time = time_str
-            
-            is_self = msg.get("isSelf", False)
-            sender_name = msg.get("senderName", "")
-            
-            if is_self:
-                formatted_sender = "自己"
-            else:
-                formatted_sender = sender_name if sender_name else "对方"
-            
-            msg_type = msg.get("type", 0)
-            msg_content = ""
-            
-            if msg_type == 1:
-                msg_content = msg.get("content", "")
-            elif msg_type == 3:
-                msg_content = "[photo]"
-            elif msg_type == 34:
-                msg_content = "[voice]"
-            elif msg_type == 43:
-                msg_content = "[video]"
-            elif msg_type == 47:
-                msg_content = "[emoji]"
-            elif msg_type == 49:
-                contents = msg.get("contents", {})
-                if contents:
-                    if "quote" in contents:
-                        quoted_content = contents["quote"].get("content", "")
-                        msg_content = f"[引用]: {quoted_content}"
-                    elif "forward" in contents:
-                        msg_content = "[转发消息]"
-                    else:
-                        msg_content = "[系统消息]"
+jieba.setLogLevel(30)
+
+TOTAL_STAGES = 4
+
+
+# ============================================================
+# 一、运行监测器（供主智能体监测统计过程）
+# ============================================================
+
+class RunMonitor:
+    """分阶段记录统计过程，最终生成 run_summary.json"""
+
+    def __init__(self, source, output_dir):
+        self.source = source
+        self.output_dir = output_dir
+        self.stages = []
+        self.started_at = datetime.now()
+
+    def _print(self, stage):
+        status_text = {"running": "进行中", "done": "完成", "failed": "失败"}[stage["status"]]
+        line = "[阶段 {}/{}] {} - {}".format(stage["stage"], TOTAL_STAGES, stage["name"], status_text)
+        if stage["detail"]:
+            line += "：{}".format(stage["detail"])
+        print(line, flush=True)
+
+    def report(self, name, status, detail=""):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 若该阶段已有"进行中"记录，则更新为最终状态
+        for stage in self.stages:
+            if stage["name"] == name and stage["status"] == "running":
+                stage["status"] = status
+                stage["detail"] = detail or stage["detail"]
+                stage["finished_at"] = now
+                self._print(stage)
+                return
+        stage = {
+            "stage": len(self.stages) + 1,
+            "name": name,
+            "status": status,
+            "detail": detail,
+            "started_at": now,
+            "finished_at": now,
+        }
+        self.stages.append(stage)
+        self._print(stage)
+
+    def fail(self, detail):
+        """将当前"进行中"的阶段标记为失败"""
+        for stage in reversed(self.stages):
+            if stage["status"] == "running":
+                stage["status"] = "failed"
+                stage["detail"] = detail
+                stage["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._print(stage)
+                return
+        self.report("执行", "failed", detail)
+
+    def summary(self, status, outputs, stats=None):
+        result = {
+            "status": status,
+            "source": self.source,
+            "started_at": self.started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stages": self.stages,
+            "outputs": outputs,
+            "statistics_summary": stats or {},
+        }
+        if status == "success":
+            result["next_step"] = (
+                "统计流程已完成。请主智能体派发心理测评子智能体，读取 "
+                "assessment_tasks.json，逐个执行 tasks 中的测评任务并汇总报告。"
+            )
+        return result
+
+
+# ============================================================
+# 二、数据获取与格式化
+# ============================================================
+
+def load_chat_messages(source, timeout):
+    """从 URL（chatlog API）或本地 JSON 文件加载原始聊天记录"""
+    if source.lower().startswith(("http://", "https://")):
+        print("正在从 URL 下载数据：{}".format(source))
+        try:
+            resp = requests.get(source, timeout=timeout)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError("下载数据失败：{}".format(e))
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError("URL 返回的内容不是有效 JSON")
+    else:
+        if not os.path.exists(source):
+            raise RuntimeError("文件不存在：{}".format(source))
+        with open(source, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except ValueError as e:
+                raise RuntimeError("JSON 解析失败：{}".format(e))
+
+    # 兼容裸数组 / {"data": [...]} / {"messages": [...]} 等返回结构
+    if isinstance(data, list):
+        messages = data
+    elif isinstance(data, dict):
+        for key in ("data", "messages", "list", "items"):
+            if isinstance(data.get(key), list):
+                messages = data[key]
+                break
+        else:
+            raise RuntimeError("返回的 JSON 中未找到聊天记录数组")
+    else:
+        raise RuntimeError("返回的 JSON 格式无法识别")
+
+    if not messages:
+        raise RuntimeError("聊天记录为空，请检查 URL 参数（如 limit/time/talker）")
+    return messages
+
+
+def _pick(msg, *keys, default=None):
+    """字段别名归一（兼容不同版本 chatlog 输出的驼峰/下划线字段）"""
+    for k in keys:
+        if msg.get(k) is not None:
+            return msg[k]
+    return default
+
+
+def format_chat_messages(raw_messages):
+    """原始 chatlog 消息 → [{time, sender, message}] 列表"""
+    optimized_messages = []
+
+    for msg in raw_messages:
+        # 时间：ISO → YYYY-MM-DD HH:MM:SS
+        time_str = _pick(msg, "time", "createTime", default="") or ""
+        formatted_time = time_str
+        if time_str:
+            try:
+                dt = datetime.fromisoformat(str(time_str).replace("Z", "+00:00"))
+                formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                formatted_time = time_str
+
+        # 发送者
+        if _pick(msg, "isSelf", "is_self", default=False):
+            formatted_sender = "自己"
+        else:
+            formatted_sender = _pick(msg, "senderName", "sender_name", "talker", default="") or "对方"
+
+        # 消息内容（按类型映射）
+        msg_type = _pick(msg, "type", "msg_type", default=0)
+        if msg_type == 1:
+            msg_content = msg.get("content", "") or ""
+        elif msg_type == 3:
+            msg_content = "[photo]"
+        elif msg_type == 34:
+            msg_content = "[voice]"
+        elif msg_type == 43:
+            msg_content = "[video]"
+        elif msg_type == 47:
+            msg_content = "[emoji]"
+        elif msg_type == 49:
+            contents = msg.get("contents") or {}
+            if contents:
+                if "quote" in contents:
+                    quoted_content = contents["quote"].get("content", "")
+                    msg_content = "[引用]: {}".format(quoted_content)
+                elif "forward" in contents:
+                    msg_content = "[转发消息]"
                 else:
                     msg_content = "[系统消息]"
-            elif msg_type in [50, 11000]:
-                msg_content = "[语音电话]"
-            elif msg_type == 10000:
-                msg_content = "[撤回消息]"
             else:
-                msg_content = "[其他消息]"
-            
-            optimized_msg = {
-                "time": formatted_time,
-                "sender": formatted_sender,
-                "message": msg_content
-            }
-            optimized_messages.append(optimized_msg)
-        
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(optimized_messages, f, ensure_ascii=False, indent=2)
-        
-        print(f"格式化完成，已保存到 {output_file}")
-        return True
-        
-    except Exception as e:
-        print(f"格式化失败: {e}")
-        return False
+                msg_content = "[系统消息]"
+        elif msg_type in (50, 11000):
+            msg_content = "[语音电话]"
+        elif msg_type == 10000:
+            msg_content = "[撤回消息]"
+        else:
+            msg_content = "[其他消息]"
+
+        optimized_messages.append({
+            "time": formatted_time,
+            "sender": formatted_sender,
+            "message": msg_content,
+        })
+
+    return optimized_messages
+
+
+# ============================================================
+# 三、统计分析（语音电话 / 常用词 / 趋势 / 频次 / 月占比）
+# ============================================================
+
+SPECIAL_MESSAGES = [
+    '[photo]', '[voice]', '[video]', '[emoji]', '[引用]',
+    '[转发消息]', '[语音电话]', '[撤回消息]', '[其他消息]', '[系统消息]'
+]
+
+STOP_WORDS = {
+    '的', '了', '是', '在', '我', '你', '他', '她', '它', '我们', '你们', '他们',
+    '这', '那', '这个', '那个', '就', '都', '也', '还', '又', '再', '很', '非常',
+    '啊', '吧', '呢', '吗', '哦', '嗯', '哈', '嘿', '呀', '啦', '嘛', '呗',
+    '不', '没', '别', '不要', '不是', '没有', '好', '对', '行', '可以', '知道',
+    '什么', '怎么', '为什么', '哪里', '谁', '哪个', '多少', '几', '时候',
+    '去', '来', '到', '从', '向', '往', '给', '为', '把', '被', '让',
+    '说', '想', '看', '做', '要', '会', '能', '可以', '应该', '需要', '想要',
+    '个', '次', '天', '年', '月', '日', '时', '分', '秒', '点', '些', '种',
+    '一个', '两个', '三个', '几个', '很多', '一些', '所有', '全部', '每个',
+    '因为', '所以', '但是', '不过', '虽然', '可是', '然后', '接着', '最后',
+    '或者', '还是', '如果', '要是', '只要', '只有', '无论', '不管', '即使',
+    '感觉', '觉得', '认为', '以为', '知道', '明白', '理解', '清楚', '记得',
+    '现在', '以前', '以后', '刚才', '马上', '立刻', '很快', '已经', '还是',
+    '真的', '确实', '当然', '肯定', '一定', '必须', '应该', '可能', '也许',
+    '这样', '那样', '怎么样', '如何', '什么', '哪里', '谁', '为什么',
+    '哈哈', '嘿嘿', '呵呵', '嘻嘻', '哎呀', '嗯嗯', '好的', '行吧', '可以啊',
+    '吗', '呢', '吧', '啊', '哦', '呀', '啦', '嘛', '呗', '嗯', '哈', '嘿'
+}
+
+
+def _parse_time(time_str):
+    return datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+
 
 def process_voice_calls(chat_data):
+    """语音通话记录表"""
     voice_call_records = []
-    
     for message in chat_data:
-        msg = message['message']
-        if msg == '[语音电话]':
-            time_str = message['time']
-            sender = message['sender']
-            datetime_obj = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-            
+        if message['message'] == '[语音电话]':
+            datetime_obj = _parse_time(message['time'])
             voice_call_records.append({
                 '日期': datetime_obj.date(),
                 '时间': datetime_obj.time(),
-                '发送者': sender,
-                '完整时间': time_str
+                '发送者': message['sender'],
+                '完整时间': message['time']
             })
-    
+
     df = pd.DataFrame(voice_call_records)
-    
     if not df.empty:
         df = df.sort_values('完整时间').reset_index(drop=True)
         df.insert(0, '序号', range(1, len(df) + 1))
-    
     return df
 
+
 def extract_text_messages(chat_data):
-    special_messages = [
-        '[photo]', '[voice]', '[video]', '[emoji]', '[引用]',
-        '[转发消息]', '[语音电话]', '[撤回消息]', '[其他消息]', '[系统消息]'
-    ]
-    
+    """过滤特殊消息，提取纯文本"""
     text_messages = []
     for message in chat_data:
         msg = message['message']
-        if msg not in special_messages and not msg.startswith('[引用]'):
+        if msg not in SPECIAL_MESSAGES and not msg.startswith('[引用]'):
             text_messages.append(msg)
-    
     return text_messages
 
+
 def process_word_frequency(text_messages):
-    stop_words = {
-        '的', '了', '是', '在', '我', '你', '他', '她', '它', '我们', '你们', '他们',
-        '这', '那', '这个', '那个', '就', '都', '也', '还', '又', '再', '很', '非常',
-        '啊', '吧', '呢', '吗', '哦', '嗯', '哈', '嘿', '呀', '啦', '嘛', '呗',
-        '不', '没', '别', '不要', '不是', '没有', '好', '对', '行', '可以', '知道',
-        '什么', '怎么', '为什么', '哪里', '谁', '哪个', '多少', '几', '时候',
-        '去', '来', '到', '从', '向', '往', '给', '为', '把', '被', '让',
-        '说', '想', '看', '做', '要', '会', '能', '可以', '应该', '需要', '想要',
-        '个', '次', '天', '年', '月', '日', '时', '分', '秒', '点', '些', '种',
-        '一个', '两个', '三个', '几个', '很多', '一些', '所有', '全部', '每个',
-        '因为', '所以', '但是', '不过', '虽然', '可是', '然后', '接着', '最后',
-        '或者', '还是', '如果', '要是', '只要', '只有', '无论', '不管', '即使',
-        '感觉', '觉得', '认为', '以为', '知道', '明白', '理解', '清楚', '记得',
-        '现在', '以前', '以后', '刚才', '马上', '立刻', '很快', '已经', '还是',
-        '真的', '确实', '当然', '肯定', '一定', '必须', '应该', '可能', '也许',
-        '这样', '那样', '怎么样', '如何', '什么', '哪里', '谁', '为什么',
-        '哈哈', '嘿嘿', '呵呵', '嘻嘻', '哎呀', '嗯嗯', '好的', '行吧', '可以啊',
-        '吗', '呢', '吧', '啊', '哦', '呀', '啦', '嘛', '呗', '嗯', '哈', '嘿'
-    }
-    
+    """分词并统计 TOP50 常用词"""
     all_text = ' '.join(text_messages)
     words = jieba.lcut(all_text)
-    
+
     filtered_words = []
     for word in words:
-        if (len(word) > 1 and 
-            word not in stop_words and 
-            not word.isdigit() and 
-            not re.match(r'^[^\w\u4e00-\u9fa5]+$', word)):
+        if (len(word) > 1 and
+                word not in STOP_WORDS and
+                not word.isdigit() and
+                not re.match(r'^[^\w\u4e00-\u9fa5]+$', word)):
             filtered_words.append(word)
-    
+
     word_counts = Counter(filtered_words)
     top_50 = word_counts.most_common(50)
-    
+
     df = pd.DataFrame(top_50, columns=['词语', '出现次数'])
-    df.insert(0, '排名', range(1, 51))
-    
+    df.insert(0, '排名', range(1, len(df) + 1))
     return df
 
+
 def process_top_10_days(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S').date()
-        dates.append(date)
-    
+    """聊天数最高 10 日"""
+    dates = [_parse_time(m['time']).date() for m in chat_data]
     df = pd.DataFrame({'date': dates})
     daily_stats = df.groupby('date').size().reset_index()
     daily_stats.columns = ['日期', '消息数量']
-    
-    top_10_stats = daily_stats.sort_values('消息数量', ascending=False).head(10).reset_index(drop=True)
-    top_10_stats.insert(0, '排名', range(1, 11))
-    
-    return top_10_stats
+
+    top_10 = daily_stats.sort_values('消息数量', ascending=False).head(10).reset_index(drop=True)
+    top_10.insert(0, '排名', range(1, len(top_10) + 1))
+    return top_10
+
 
 def process_hourly_trend(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-        dates.append(date)
-    
+    """24 小时消息分布"""
+    dates = [_parse_time(m['time']) for m in chat_data]
     df = pd.DataFrame({'datetime': dates})
     df['hour'] = df['datetime'].dt.hour
-    
+
     hourly_stats = df.groupby('hour').size().reset_index()
     hourly_stats.columns = ['hour', 'count']
-    
+
     all_hours = pd.DataFrame({'hour': range(24)})
     hourly_stats = all_hours.merge(hourly_stats, on='hour', how='left').fillna(0)
     hourly_stats.columns = ['小时', '消息数量']
     hourly_stats['消息数量'] = hourly_stats['消息数量'].astype(int)
-    
     return hourly_stats
 
-def process_weekly_trend(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-        dates.append(date)
-    
+
+def process_weekday_trend(chat_data):
+    """周内（周一至周日）消息分布"""
+    dates = [_parse_time(m['time']) for m in chat_data]
     df = pd.DataFrame({'datetime': dates})
     df['weekday'] = df['datetime'].dt.weekday
-    
+
     weekly_stats = df.groupby('weekday').size().reset_index()
     weekly_stats.columns = ['weekday', 'count']
-    
+
     all_weekdays = pd.DataFrame({'weekday': range(7)})
     weekly_stats = all_weekdays.merge(weekly_stats, on='weekday', how='left').fillna(0)
     weekly_stats.columns = ['星期', '消息数量']
     weekly_stats['消息数量'] = weekly_stats['消息数量'].astype(int)
-    
+
     weekday_names = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
     weekly_stats['星期'] = weekly_stats['星期'].map(lambda x: weekday_names[x])
-    
     return weekly_stats
 
-def process_monthly_trend(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-        dates.append(date)
-    
+
+def process_monthday_trend(chat_data):
+    """月内（1-31 日）消息分布"""
+    dates = [_parse_time(m['time']) for m in chat_data]
     df = pd.DataFrame({'datetime': dates})
     df['day'] = df['datetime'].dt.day
-    
+
     monthly_stats = df.groupby('day').size().reset_index()
     monthly_stats.columns = ['day', 'count']
-    
-    all_days = pd.DataFrame({'day': range(1, 31)})
+
+    all_days = pd.DataFrame({'day': range(1, 32)})
     monthly_stats = all_days.merge(monthly_stats, on='day', how='left').fillna(0)
     monthly_stats.columns = ['日期', '消息数量']
     monthly_stats['消息数量'] = monthly_stats['消息数量'].astype(int)
-    
     return monthly_stats
 
+
 def process_weekly_data(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-        dates.append(date)
-    
+    """逐周消息数量"""
+    dates = [_parse_time(m['time']) for m in chat_data]
     df = pd.DataFrame({'datetime': dates})
-    df['date'] = df['datetime'].dt.date
     df['year_week'] = df['datetime'].dt.strftime('%Y-%W')
     df['week_start'] = df['datetime'].dt.to_period('W').apply(lambda x: x.start_time.date())
     df['week_end'] = df['datetime'].dt.to_period('W').apply(lambda x: x.end_time.date())
-    
+
     weekly_stats = df.groupby(['year_week', 'week_start', 'week_end']).size().reset_index()
     weekly_stats.columns = ['年-周', '周开始日期', '周结束日期', '消息数量']
-    weekly_stats = weekly_stats.sort_values('年-周').reset_index(drop=True)
-    
-    return weekly_stats
+    return weekly_stats.sort_values('年-周').reset_index(drop=True)
+
 
 def process_monthly_data(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-        dates.append(date)
-    
+    """逐月消息数量"""
+    dates = [_parse_time(m['time']) for m in chat_data]
     df = pd.DataFrame({'datetime': dates})
     df['year_month'] = df['datetime'].dt.strftime('%Y-%m')
-    
+
     monthly_stats = df.groupby('year_month').size().reset_index()
     monthly_stats.columns = ['年月', '消息数量']
-    monthly_stats = monthly_stats.sort_values('年月').reset_index(drop=True)
-    
-    return monthly_stats
+    return monthly_stats.sort_values('年月').reset_index(drop=True)
+
 
 def process_monthly_percentage(chat_data):
-    dates = []
-    for message in chat_data:
-        time_str = message['time']
-        date = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S').date()
-        dates.append(date)
-    
+    """每月聊天天数占当月总天数的比例"""
+    dates = [_parse_time(m['time']).date() for m in chat_data]
     df = pd.DataFrame({'date': dates})
     df['date'] = pd.to_datetime(df['date'])
-    
     df['year_month'] = df['date'].dt.strftime('%Y-%m')
+
     monthly_chat_days = df.groupby('year_month')['date'].nunique().reset_index()
     monthly_chat_days.columns = ['年月', '聊天天数']
-    
-    monthly_chat_days['总天数'] = monthly_chat_days['年月'].apply(lambda x: 
+    monthly_chat_days['总天数'] = monthly_chat_days['年月'].apply(lambda x:
         calendar.monthrange(int(x.split('-')[0]), int(x.split('-')[1]))[1])
-    
-    monthly_chat_days['占比'] = monthly_chat_days['聊天天数'] / monthly_chat_days['总天数']
-    monthly_chat_days['占比(%)'] = monthly_chat_days['占比'].apply(lambda x: f"{x:.2%}")
-    
+    monthly_chat_days['占比(%)'] = (monthly_chat_days['聊天天数'] /
+                                    monthly_chat_days['总天数']).apply(lambda x: "{:.2%}".format(x))
     return monthly_chat_days
+
+
+def run_all_stats(chat_data, output_file):
+    """执行全量统计分析并写入 Excel，返回 {sheet_name: DataFrame}"""
+    frames = {}
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        voice_call_data = process_voice_calls(chat_data)
+        if not voice_call_data.empty:
+            voice_call_data.to_excel(writer, sheet_name='语音电话表', index=False)
+            frames['语音电话表'] = voice_call_data
+            print("  - 语音电话统计：{} 条记录".format(len(voice_call_data)))
+
+        word_stats = process_word_frequency(extract_text_messages(chat_data))
+        word_stats.to_excel(writer, sheet_name='常用词表', index=False)
+        frames['常用词表'] = word_stats
+        print("  - 常用词语统计：TOP{}".format(len(word_stats)))
+
+        top_10_stats = process_top_10_days(chat_data)
+        top_10_stats.to_excel(writer, sheet_name='聊天数最高10日表', index=False)
+        frames['聊天数最高10日表'] = top_10_stats
+        print("  - 聊天数最高10日统计完成")
+
+        process_hourly_trend(chat_data).to_excel(writer, sheet_name='24小时趋势表', index=False)
+        process_weekday_trend(chat_data).to_excel(writer, sheet_name='周趋势表', index=False)
+        process_monthday_trend(chat_data).to_excel(writer, sheet_name='月趋势表', index=False)
+        print("  - 24小时/周/月趋势统计完成")
+
+        process_weekly_data(chat_data).to_excel(writer, sheet_name='周消息数量表', index=False)
+        process_monthly_data(chat_data).to_excel(writer, sheet_name='月消息数量表', index=False)
+        print("  - 周/月消息频次统计完成")
+
+        process_monthly_percentage(chat_data).to_excel(writer, sheet_name='消息月占比', index=False)
+        print("  - 消息月占比统计完成")
+
+        # 自动调整列宽
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for column_cells in worksheet.columns:
+                length = max(len(str(cell.value)) for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = length + 2
+
+    return frames
+
+
+# ============================================================
+# 四、心理测评任务包（供主智能体派发子智能体执行）
+# ============================================================
+
+PSYCH_SYSTEM_PROMPT = """你是一位专业的心理测评专家，擅长基于日常聊天记录分析个体的情绪状态与心理特征。请严格遵守以下原则：
+1. 仅基于聊天记录中的客观内容进行分析，不做无依据的推测；
+2. 测评结果仅供自我了解、情绪关怀与关系参考，不构成临床心理诊断；
+3. 语言专业、温和、具有建设性，避免评判性表述。"""
+
+PSYCH_USER_TEMPLATE = """请对以下一周的聊天记录进行心理测评，并按模板输出结构化的 Markdown 测评报告。
+
+【测评报告模板】
+## 一、情绪状态分析
+（积极 / 中性 / 消极情绪的分布与大致占比，本周情绪整体基调）
+## 二、情绪变化趋势
+（本周内情绪的起伏、转折点及其触发原因）
+## 三、关键心理事件
+（引发明显情绪波动的重要对话，可引用原文关键句）
+## 四、心理特征观察
+（压力水平、焦虑信号、情绪稳定性、社交互动模式等维度）
+## 五、综合测评结论
+（用 3-5 句话总结本周整体心理状态）
+## 六、关怀建议
+（给出 2-3 条具体、可操作的建议）
+
+聊天记录时间范围：{start_time} 到 {end_time}
+聊天记录（共 {count} 条）：
+{chat_text}"""
+
 
 def chat_to_dataframe(chat_data):
     df = pd.DataFrame(chat_data)
@@ -312,323 +491,207 @@ def chat_to_dataframe(chat_data):
     df['week'] = df['datetime'].dt.to_period('W')
     return df
 
+
 def group_by_week(df):
-    weekly_groups = df.groupby('week')
-    
+    """按周分组，返回每周的聊天记录"""
     weekly_chats = []
-    for week, group in weekly_groups:
+    for week, group in df.groupby('week'):
         week_chats = group.sort_values('datetime')
-        start_date = week_chats['datetime'].min().strftime('%Y-%m-%d %H:%M:%S')
-        end_date = week_chats['datetime'].max().strftime('%Y-%m-%d %H:%M:%S')
-        
         weekly_chats.append({
             'week': week,
-            'start_time': start_date,
-            'end_time': end_date,
+            'start_time': week_chats['datetime'].min().strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': week_chats['datetime'].max().strftime('%Y-%m-%d %H:%M:%S'),
             'messages': week_chats.to_dict('records'),
             'count': len(week_chats)
         })
-    
     weekly_chats.sort(key=lambda x: x['week'].start_time)
     return weekly_chats
+
 
 def format_chat_for_ai(messages):
     formatted = []
     for msg in messages:
-        sender = msg['sender']
-        content = msg['message']
-        time_str = msg['time']
-        formatted.append(f"[{time_str}] {sender}: {content}")
+        formatted.append("[{}] {}: {}".format(msg['time'], msg['sender'], msg['message']))
     return '\n'.join(formatted)
 
-def analyze_emotion(chat_text, week_info, client, model_list):
-    current_model_index = 0
-    
-    prompt = f"""你是一个专业的情感分析专家，请分析以下聊天记录的情绪变化，包括：
-1. 主要情绪类型（积极、中性、消极）及分布
-2. 情绪变化趋势（从开始到结束的情绪变化）
-3. 关键情绪事件（引发情绪变化的重要对话）
-4. 情绪强度分析（各情绪的强烈程度）
-5. 总体情绪总结
 
-请以结构化的方式提供分析结果，方便后续整理。
-
-聊天记录时间范围：{week_info['start_time']} 到 {week_info['end_time']}
-聊天记录（共{week_info['count']}条）：
-{chat_text}"""
-
-    for attempt in range(3):
-        model = model_list[current_model_index]
-        current_model_index = (current_model_index + 1) % len(model_list)
-        
-        print(f"\n正在使用模型：{model} (尝试 {attempt+1}/3)")
-        
-        try:
-            extra_body = {"enable_thinking": True}
-            
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {'role': 'system', 'content': '你是一个专业的情感分析专家，请分析聊天记录的情绪变化。'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                stream=True,
-                extra_body=extra_body
-            )
-            
-            print("\n=== AI 正在分析，请稍候 ===\n")
-            
-            thinking_content = ""
-            final_answer = ""
-            done_thinking = False
-            
-            for chunk in response:
-                if chunk.choices:
-                    thinking_chunk = chunk.choices[0].delta.reasoning_content
-                    answer_chunk = chunk.choices[0].delta.content
-                    if thinking_chunk != '':
-                        thinking_content += thinking_chunk
-                    elif answer_chunk != '':
-                        if not done_thinking:
-                            print("=== AI 分析结果 ===\n")
-                            done_thinking = True
-                        final_answer += answer_chunk
-                        print(answer_chunk, end='', flush=True)
-            
-            print("\n\n=== 分析完成 ===")
-            return final_answer
-            
-        except RateLimitError as e:
-            print(f"\n模型 {model} 达到速率限制，正在切换到下一个模型...")
-            print(f"错误信息：{e}")
-            time.sleep(2)
-        except Exception as e:
-            print(f"\n调用模型 {model} 时发生错误，正在切换到下一个模型...")
-            print(f"错误信息：{e}")
-            time.sleep(2)
-    
-    return "[分析失败：所有模型都无法使用]"
-
-def emotion_analysis(input_file, api_base_url, api_key, output_file):
-    client = OpenAI(base_url=api_base_url, api_key=api_key)
-    
-    model_list = [
-        'deepseek-ai/DeepSeek-V3.2',
-        'deepseek-ai/DeepSeek-R1-Distill-Llama-70B',
-        'Qwen/Qwen3-Next-80B-A3B-Instruct'
-    ]
-    
-    print("正在读取聊天记录...")
-    chat_data = read_chat_history(input_file)
-    
+def build_assessment_tasks(chat_data, source):
+    """将聊天记录按周分批，生成心理测评任务包（由外部子智能体执行）"""
     df = chat_to_dataframe(chat_data)
     weekly_chats = group_by_week(df)
-    
-    print(f"\n共分为 {len(weekly_chats)} 个周批次\n")
-    
-    all_results = []
-    if os.path.exists(output_file):
-        try:
-            with open(output_file, 'r', encoding='utf-8') as f:
-                all_results = json.load(f)
-            print(f"已加载 {len(all_results)} 条现有结果")
-        except:
-            print("加载现有结果失败，将重新开始")
-            all_results = []
-    
-    for i in range(len(weekly_chats)):
-        week_chat = weekly_chats[i]
-        
-        print(f"\n{'='*60}")
-        print(f"批次 {i+1}/{len(weekly_chats)}")
-        print(f"时间范围：{week_chat['start_time']} 到 {week_chat['end_time']}")
-        print(f"消息数量：{week_chat['count']} 条")
-        print(f"{'='*60}")
-        
-        batch_exists = False
-        for result in all_results:
-            if result['batch'] == i+1:
-                batch_exists = True
-                print(f"\n该批次已处理过，跳过...")
-                break
-        
-        if batch_exists:
-            continue
-        
-        chat_text = format_chat_for_ai(week_chat['messages'])
-        emotion_result = analyze_emotion(chat_text, week_chat, client, model_list)
-        
-        result = {
-            'batch': i+1,
-            'week': str(week_chat['week']),
-            'start_time': week_chat['start_time'],
-            'end_time': week_chat['end_time'],
-            'message_count': week_chat['count'],
-            'emotion_analysis': emotion_result
-        }
-        all_results.append(result)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, ensure_ascii=False, indent=2)
-        print(f"\n结果已保存到 {output_file}")
-        
-        if i < len(weekly_chats) - 1:
-            print(f"\n将在 10 秒后自动处理下一批次...")
-            for j in range(10, 0, -1):
-                print(f"{j}...", end='', flush=True)
-                time.sleep(1)
-            print("\n")
-    
-    print(f"\n=== 聊天情绪分析完成 ===")
-    print(f"共处理 {len(all_results)} 个周批次")
-    print(f"结果文件：{output_file}")
 
-def run_all_stats(input_file, output_file):
-    print("正在读取聊天记录...")
-    chat_data = read_chat_history(input_file)
-    
-    print("正在执行统计分析...")
-    
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        voice_call_data = process_voice_calls(chat_data)
-        if not voice_call_data.empty:
-            voice_call_data.to_excel(writer, sheet_name='语音电话表', index=False)
-            print(f"  - 语音电话统计: {len(voice_call_data)} 条记录")
-        
-        text_messages = extract_text_messages(chat_data)
-        word_stats = process_word_frequency(text_messages)
-        word_stats.to_excel(writer, sheet_name='常用词表', index=False)
-        print(f"  - 常用词语统计: TOP50")
-        
-        top_10_stats = process_top_10_days(chat_data)
-        top_10_stats.to_excel(writer, sheet_name='聊天数最高10日表', index=False)
-        print(f"  - 聊天数最高10日统计完成")
-        
-        hourly_stats = process_hourly_trend(chat_data)
-        hourly_stats.to_excel(writer, sheet_name='24小时趋势表', index=False)
-        
-        weekly_stats = process_weekly_trend(chat_data)
-        weekly_stats.to_excel(writer, sheet_name='周趋势表', index=False)
-        
-        monthly_stats = process_monthly_trend(chat_data)
-        monthly_stats.to_excel(writer, sheet_name='月趋势表', index=False)
-        print(f"  - 24小时/周/月趋势统计完成")
-        
-        weekly_data = process_weekly_data(chat_data)
-        weekly_data.to_excel(writer, sheet_name='周消息数量表', index=False)
-        
-        monthly_data = process_monthly_data(chat_data)
-        monthly_data.to_excel(writer, sheet_name='月消息数量表', index=False)
-        print(f"  - 周/月消息频次统计完成")
-        
-        monthly_percentage = process_monthly_percentage(chat_data)
-        monthly_percentage.to_excel(writer, sheet_name='消息月占比', index=False)
-        print(f"  - 消息月占比统计完成")
-        
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
-            for column_cells in worksheet.columns:
-                length = max(len(str(cell.value)) for cell in column_cells)
-                worksheet.column_dimensions[column_cells[0].column_letter].width = length + 2
-    
-    print(f"\n所有统计完成！结果已保存到 {output_file}")
+    tasks = []
+    for i, week in enumerate(weekly_chats):
+        chat_text = format_chat_for_ai(week['messages'])
+        tasks.append({
+            "task_type": "psychological_assessment",
+            "task_id": "batch_{:03d}".format(i + 1),
+            "batch": i + 1,
+            "week": str(week['week']),
+            "time_range": {"start": week['start_time'], "end": week['end_time']},
+            "message_count": week['count'],
+            "result_file_suggestion": "assessment_results/batch_{:03d}.md".format(i + 1),
+            "sub_agent": {
+                "role": "心理测评子智能体",
+                "system_prompt": PSYCH_SYSTEM_PROMPT,
+                "user_prompt": PSYCH_USER_TEMPLATE.format(
+                    start_time=week['start_time'],
+                    end_time=week['end_time'],
+                    count=week['count'],
+                    chat_text=chat_text,
+                ),
+            },
+        })
 
-def show_menu():
-    print("\n" + "="*60)
-    print("         微信聊天记录分析工具")
-    print("="*60)
-    print("1. 格式化聊天记录JSON文件")
-    print("2. 统计分析（语音电话、常用词、消息趋势等）")
-    print("3. 情绪分析（需要API配置）")
-    print("4. 查看情绪分析结果")
-    print("5. 退出")
-    print("="*60)
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "total_tasks": len(tasks),
+        "instructions_for_main_agent": (
+            "你是主智能体，负责监测与调度：\n"
+            "1. 调用统计脚本 python main.py <URL>，通过 run_summary.json 监测各阶段状态；\n"
+            "2. 统计完成后读取本文件，将 tasks 数组中的任务逐个派发给心理测评子智能体；\n"
+            "3. 收集子智能体产出的测评报告，按 task_id / 时间顺序汇总为最终心理测评总报告。"
+        ),
+        "instructions_for_sub_agent": (
+            "你是心理测评子智能体，收到一个任务包后：\n"
+            "1. 将 task.sub_agent.system_prompt 设为你的系统提示词；\n"
+            "2. 将 task.sub_agent.user_prompt 作为用户消息（其中已包含完整聊天记录）；\n"
+            "3. 按模板输出结构化心理测评报告（Markdown），保存到 task.result_file_suggestion "
+            "指示的位置（相对于统计输出目录），或交回主智能体汇总。"
+        ),
+        "tasks": tasks,
+    }
+
+
+# ============================================================
+# 五、运行摘要
+# ============================================================
+
+def build_stats_summary(chat_data, frames, task_count):
+    if not chat_data:
+        return {}
+    times = [m['time'] for m in chat_data if m.get('time')]
+    senders = Counter(m['sender'] for m in chat_data)
+
+    voice_df = frames.get('语音电话表')
+    word_df = frames.get('常用词表')
+    days_df = frames.get('聊天数最高10日表')
+
+    return {
+        "message_count": len(chat_data),
+        "time_range": {"start": min(times), "end": max(times)},
+        "sender_distribution": dict(senders),
+        "voice_call_count": 0 if voice_df is None else len(voice_df),
+        "top_10_words": [
+            {"排名": int(r['排名']), "词语": r['词语'], "出现次数": int(r['出现次数'])}
+            for r in (word_df.head(10).to_dict('records') if word_df is not None else [])
+        ],
+        "top_5_chat_days": [
+            {"排名": int(r['排名']), "日期": str(r['日期']), "消息数量": int(r['消息数量'])}
+            for r in (days_df.head(5).to_dict('records') if days_df is not None else [])
+        ],
+        "assessment_task_count": task_count,
+    }
+
+
+# ============================================================
+# 六、主流程：输入一个 URL，返回所有结果
+# ============================================================
 
 def main():
-    print("欢迎使用微信聊天记录分析工具！")
-    
-    json_file = input("请输入要分析的聊天记录JSON文件路径: ").strip()
-    
-    if not json_file:
-        print("文件路径不能为空！")
-        return
-    
-    base_name = json_file.rsplit('.', 1)[0] if '.' in json_file else json_file
-    format_file = f"{base_name}_format.json"
-    excel_file = f"{base_name}_analysis.xlsx"
-    emotion_file = f"{base_name}_emotion.json"
-    
-    while True:
-        show_menu()
-        choice = input("请选择功能（1-5）: ").strip()
-        
-        if choice == '1':
-            print(f"\n正在格式化 {json_file}...")
-            format_chat_json(json_file, format_file)
-            
-        elif choice == '2':
-            if not os.path.exists(format_file):
-                print(f"\n格式化文件不存在，请先执行功能1进行格式化！")
-                continue
-            print(f"\n正在对 {format_file} 进行统计分析...")
-            run_all_stats(format_file, excel_file)
-            
-        elif choice == '3':
-            if not os.path.exists(format_file):
-                print(f"\n格式化文件不存在，请先执行功能1进行格式化！")
-                continue
-            
-            print("\n=== API 配置 ===")
-            api_base = input("请输入API Base URL（如 https://api-inference.modelscope.cn/v1）: ").strip()
-            api_key = input("请输入API Key: ").strip()
-            
-            if not api_base or not api_key:
-                print("API配置不能为空！")
-                continue
-            
-            print(f"\n正在对 {format_file} 进行情绪分析...")
-            emotion_analysis(format_file, api_base, api_key, emotion_file)
-            
-        elif choice == '4':
-            if not os.path.exists(emotion_file):
-                print(f"\n情绪分析结果文件不存在，请先执行功能3！")
-                continue
-            
-            try:
-                with open(emotion_file, 'r', encoding='utf-8') as f:
-                    results = json.load(f)
-                
-                print(f"\n共读取到 {len(results)} 个批次的分析结果")
-                print("="*80)
-                print("聊天情绪分析结果")
-                print("="*80)
-                
-                for i, result in enumerate(results):
-                    print("\n" + "="*80)
-                    print(f"批次 {result['batch']}（共 {len(results)} 个批次，当前第 {i+1} 个）")
-                    print(f"时间范围：{result['start_time']} 到 {result['end_time']}")
-                    print(f"消息数量：{result['message_count']} 条")
-                    print("="*80)
-                    print("\n情绪分析结果：")
-                    print(result['emotion_analysis'])
-                    print("\n" + "="*80)
-                    
-                    if i < len(results) - 1:
-                        user_input = input("\n按回车键继续查看下一个批次，输入 'q' 退出：")
-                        if user_input.lower() == 'q':
-                            print("\n已退出查看")
-                            break
-                else:
-                    print("\n\n所有批次已查看完毕")
-                    
-            except Exception as e:
-                print(f"读取情绪分析结果失败: {e}")
-            
-        elif choice == '5':
-            print("\n感谢使用，再见！")
-            break
-        else:
-            print("\n无效选择，请重新输入！")
+    parser = argparse.ArgumentParser(
+        description="微信聊天记录分析工具（单文件版）：输入一个 chatlog API URL，"
+                    "自动完成下载、格式化、全量统计，并生成心理测评任务包。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='示例：\n'
+               '  python main.py "http://127.0.0.1:5030/api/v1/chatlog?limit=100000"\n'
+               '  python main.py chat.json -o output\n'
+               '注意：URL 含 & 等特殊字符时请用引号包裹。'
+    )
+    parser.add_argument('source', help='chatlog API 地址（或本地聊天记录 JSON 文件路径）')
+    parser.add_argument('-o', '--output', default='output', help='输出目录（默认：output）')
+    parser.add_argument('--timeout', type=int, default=60, help='URL 下载超时秒数（默认：60）')
+    args = parser.parse_args()
+
+    output_dir = args.output
+    os.makedirs(output_dir, exist_ok=True)
+    outputs = {
+        "formatted_chat": os.path.join(output_dir, "chat_format.json"),
+        "statistics": os.path.join(output_dir, "chat_analysis.xlsx"),
+        "assessment_tasks": os.path.join(output_dir, "assessment_tasks.json"),
+        "run_summary": os.path.join(output_dir, "run_summary.json"),
+    }
+
+    monitor = RunMonitor(args.source, output_dir)
+
+    print("=" * 60)
+    print("微信聊天记录分析工具（单文件版）")
+    print("=" * 60)
+
+    try:
+        # 阶段 1：数据下载
+        monitor.report("数据下载", "running")
+        raw_messages = load_chat_messages(args.source, args.timeout)
+        monitor.report("数据下载", "done", "共获取 {} 条原始消息".format(len(raw_messages)))
+
+        # 阶段 2：格式化
+        monitor.report("格式化聊天记录", "running")
+        chat_data = format_chat_messages(raw_messages)
+        with open(outputs["formatted_chat"], "w", encoding="utf-8") as f:
+            json.dump(chat_data, f, ensure_ascii=False, indent=2)
+        monitor.report("格式化聊天记录", "done",
+                       "共 {} 条，已保存 {}".format(len(chat_data), outputs["formatted_chat"]))
+
+        # 阶段 3：全量统计
+        monitor.report("全量统计分析", "running")
+        frames = run_all_stats(chat_data, outputs["statistics"])
+        monitor.report("全量统计分析", "done", "已生成 {}".format(outputs["statistics"]))
+
+        # 阶段 4：心理测评任务包
+        monitor.report("生成心理测评任务包", "running")
+        task_doc = build_assessment_tasks(chat_data, args.source)
+        with open(outputs["assessment_tasks"], "w", encoding="utf-8") as f:
+            json.dump(task_doc, f, ensure_ascii=False, indent=2)
+        monitor.report("生成心理测评任务包", "done",
+                       "共 {} 个周批次任务，已保存 {}".format(
+                           task_doc["total_tasks"], outputs["assessment_tasks"]))
+
+        # 运行摘要（供主智能体监测）
+        stats_summary = build_stats_summary(chat_data, frames, task_doc["total_tasks"])
+        summary = monitor.summary("success", outputs, stats_summary)
+        with open(outputs["run_summary"], "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        print()
+        print("=" * 60)
+        print("全部完成！输出文件：")
+        for path in outputs.values():
+            print("  - {}".format(path))
+        print("=" * 60)
+        print()
+        print("消息总数：{message_count}，时间范围：{start} ~ {end}".format(
+            message_count=stats_summary.get("message_count", 0),
+            start=stats_summary.get("time_range", {}).get("start", ""),
+            end=stats_summary.get("time_range", {}).get("end", "")))
+        print()
+        print("下一步（主智能体）：派发心理测评子智能体，读取 assessment_tasks.json，")
+        print("逐个执行 tasks 中的测评任务（包内含完整提示词与聊天记录），")
+        print("并按 task.result_file_suggestion 汇总测评报告。")
+        return 0
+
+    except Exception as e:
+        monitor.fail(str(e))
+        summary = monitor.summary("failed", outputs)
+        try:
+            with open(outputs["run_summary"], "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        print("\n执行失败：{}".format(e), file=sys.stderr)
+        print("失败详情已写入 {}".format(outputs["run_summary"]), file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
