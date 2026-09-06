@@ -13,7 +13,7 @@
 
 输出（默认在 ./output 下）：
     chat_format.json       格式化后的聊天记录
-    chat_analysis.xlsx     全量统计结果（语音电话、常用词、消息趋势等）
+    chat_analysis.xlsx     全量统计结果（语音电话、常用词、消息趋势等，每张工作表附带对应图表）
     assessment_tasks.json  心理测评任务包（供子智能体执行，包内含完整提示词与聊天记录）
     run_summary.json       运行摘要（各阶段状态与统计概要，供主智能体监测统计过程）
 
@@ -34,6 +34,9 @@ from datetime import datetime
 import jieba
 import pandas as pd
 import requests
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.marker import Marker
 
 jieba.setLogLevel(30)
 
@@ -411,8 +414,93 @@ def process_monthly_percentage(chat_data):
     return monthly_chat_days
 
 
+# ------------------------------------------------------------
+# 图表生成（每张工作表的数据对应生成图表）
+# ------------------------------------------------------------
+
+WORD_CHART_TOP_N = 15  # 常用词图表展示的词语数量
+
+
+def _add_chart(ws, kind, title, cat_col, val_col, n_rows, anchor, x_title, y_title,
+               last_val_col=None, top_n=None, width=18, height=9):
+    """为工作表数据生成图表并锚定到 anchor 单元格。
+
+    数据布局约定：第 1 行为表头，第 2 至 n_rows+1 行为数据。
+    kind：'bar' 柱状图 / 'hbar' 横向条形图 / 'line' 折线图；
+    val_col..last_val_col 为数值列（多列时生成多条数据系列）；
+    top_n 指定时仅取前 top_n 行数据作图。
+    """
+    if n_rows <= 0:
+        return
+    last_val_col = last_val_col or val_col
+    last_row = (n_rows if top_n is None else min(n_rows, top_n)) + 1
+    data = Reference(ws, min_col=val_col, max_col=last_val_col, min_row=1, max_row=last_row)
+    cats = Reference(ws, min_col=cat_col, min_row=2, max_row=last_row)
+
+    if kind == 'line':
+        chart = LineChart()
+    else:
+        chart = BarChart()
+        chart.type = 'bar' if kind == 'hbar' else 'col'
+        chart.gapWidth = 60
+
+    chart.title = title
+    chart.style = 10
+    chart.width = width
+    chart.height = height
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.x_axis.title = x_title
+    chart.y_axis.title = y_title
+
+    if kind == 'line':
+        for series in chart.series:
+            series.smooth = False
+            series.marker = Marker(symbol='circle', size=5)
+    else:
+        if kind == 'hbar':
+            # 反转分类方向，使第一行数据显示在最上方
+            chart.x_axis.scaling.orientation = 'maxMin'
+            chart.y_axis.crosses = 'max'
+        chart.dataLabels = DataLabelList()
+        chart.dataLabels.showVal = True
+
+    ws.add_chart(chart, anchor)
+
+
+def _add_voice_call_chart(ws, df):
+    """在语音电话表下方追加"按日期统计通话次数"数据块，并生成对应柱状图"""
+    daily = df['日期'].value_counts().sort_index()
+
+    label_row = len(df) + 3  # 主表占 1 行表头 + len(df) 行数据，空 1 行后开始
+    header_row = label_row + 1
+    ws.cell(row=label_row, column=1, value='按日期统计通话次数')
+    ws.cell(row=header_row, column=1, value='日期')
+    ws.cell(row=header_row, column=2, value='通话次数')
+    for i, (day, count) in enumerate(daily.items()):
+        ws.cell(row=header_row + 1 + i, column=1, value=str(day))
+        ws.cell(row=header_row + 1 + i, column=2, value=int(count))
+
+    chart = BarChart()
+    chart.type = 'col'
+    chart.title = '每日语音通话次数'
+    chart.style = 10
+    chart.gapWidth = 60
+    chart.width = 18
+    chart.height = 9
+    data = Reference(ws, min_col=2, min_row=header_row, max_row=header_row + len(daily))
+    cats = Reference(ws, min_col=1, min_row=header_row + 1, max_row=header_row + len(daily))
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.x_axis.title = '日期'
+    chart.y_axis.title = '通话次数'
+    chart.dataLabels = DataLabelList()
+    chart.dataLabels.showVal = True
+    ws.add_chart(chart, 'G2')
+
+
 def run_all_stats(chat_data, output_file):
-    """执行全量统计分析并写入 Excel，返回 {sheet_name: DataFrame}"""
+    """执行全量统计分析并写入 Excel，每张工作表附带对应图表"""
     frames = {}
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -420,29 +508,64 @@ def run_all_stats(chat_data, output_file):
         if not voice_call_data.empty:
             voice_call_data.to_excel(writer, sheet_name='语音电话表', index=False)
             frames['语音电话表'] = voice_call_data
-            print("  - 语音电话统计：{} 条记录".format(len(voice_call_data)))
+            _add_voice_call_chart(writer.sheets['语音电话表'], voice_call_data)
+            print("  - 语音电话统计：{} 条记录（含每日通话次数图表）".format(len(voice_call_data)))
 
         word_stats = process_word_frequency(extract_text_messages(chat_data))
         word_stats.to_excel(writer, sheet_name='常用词表', index=False)
         frames['常用词表'] = word_stats
-        print("  - 常用词语统计：TOP{}".format(len(word_stats)))
+        word_chart_n = min(len(word_stats), WORD_CHART_TOP_N)
+        _add_chart(writer.sheets['常用词表'], 'hbar', '常用词语 TOP{}'.format(word_chart_n),
+                   cat_col=2, val_col=3, n_rows=len(word_stats), anchor='E2',
+                   x_title='词语', y_title='出现次数', top_n=WORD_CHART_TOP_N, height=12)
+        print("  - 常用词语统计：TOP{}（含词频图表）".format(len(word_stats)))
 
         top_10_stats = process_top_10_days(chat_data)
         top_10_stats.to_excel(writer, sheet_name='聊天数最高10日表', index=False)
         frames['聊天数最高10日表'] = top_10_stats
-        print("  - 聊天数最高10日统计完成")
+        _add_chart(writer.sheets['聊天数最高10日表'], 'bar', '聊天数最高10日',
+                   cat_col=2, val_col=3, n_rows=len(top_10_stats), anchor='E2',
+                   x_title='日期', y_title='消息数量')
+        print("  - 聊天数最高10日统计完成（含图表）")
 
-        process_hourly_trend(chat_data).to_excel(writer, sheet_name='24小时趋势表', index=False)
-        process_weekday_trend(chat_data).to_excel(writer, sheet_name='周趋势表', index=False)
-        process_monthday_trend(chat_data).to_excel(writer, sheet_name='月趋势表', index=False)
-        print("  - 24小时/周/月趋势统计完成")
+        hourly_stats = process_hourly_trend(chat_data)
+        hourly_stats.to_excel(writer, sheet_name='24小时趋势表', index=False)
+        _add_chart(writer.sheets['24小时趋势表'], 'line', '24小时消息分布',
+                   cat_col=1, val_col=2, n_rows=len(hourly_stats), anchor='D2',
+                   x_title='小时', y_title='消息数量', width=20)
 
-        process_weekly_data(chat_data).to_excel(writer, sheet_name='周消息数量表', index=False)
-        process_monthly_data(chat_data).to_excel(writer, sheet_name='月消息数量表', index=False)
-        print("  - 周/月消息频次统计完成")
+        weekday_stats = process_weekday_trend(chat_data)
+        weekday_stats.to_excel(writer, sheet_name='周趋势表', index=False)
+        _add_chart(writer.sheets['周趋势表'], 'bar', '一周消息分布（周一至周日）',
+                   cat_col=1, val_col=2, n_rows=len(weekday_stats), anchor='D2',
+                   x_title='星期', y_title='消息数量')
 
-        process_monthly_percentage(chat_data).to_excel(writer, sheet_name='消息月占比', index=False)
-        print("  - 消息月占比统计完成")
+        monthday_stats = process_monthday_trend(chat_data)
+        monthday_stats.to_excel(writer, sheet_name='月趋势表', index=False)
+        _add_chart(writer.sheets['月趋势表'], 'line', '月内每日消息分布（1-31日）',
+                   cat_col=1, val_col=2, n_rows=len(monthday_stats), anchor='D2',
+                   x_title='日期', y_title='消息数量', width=20)
+        print("  - 24小时/周/月趋势统计完成（含图表）")
+
+        weekly_data = process_weekly_data(chat_data)
+        weekly_data.to_excel(writer, sheet_name='周消息数量表', index=False)
+        _add_chart(writer.sheets['周消息数量表'], 'line', '每周消息数量趋势',
+                   cat_col=1, val_col=4, n_rows=len(weekly_data), anchor='F2',
+                   x_title='周', y_title='消息数量', width=20)
+
+        monthly_data = process_monthly_data(chat_data)
+        monthly_data.to_excel(writer, sheet_name='月消息数量表', index=False)
+        _add_chart(writer.sheets['月消息数量表'], 'bar', '每月消息数量',
+                   cat_col=1, val_col=2, n_rows=len(monthly_data), anchor='D2',
+                   x_title='月份', y_title='消息数量')
+        print("  - 周/月消息频次统计完成（含图表）")
+
+        monthly_percentage = process_monthly_percentage(chat_data)
+        monthly_percentage.to_excel(writer, sheet_name='消息月占比', index=False)
+        _add_chart(writer.sheets['消息月占比'], 'bar', '每月聊天天数与当月总天数',
+                   cat_col=1, val_col=2, last_val_col=3, n_rows=len(monthly_percentage),
+                   anchor='F2', x_title='月份', y_title='天数')
+        print("  - 消息月占比统计完成（含图表）")
 
         # 自动调整列宽
         for sheet_name in writer.sheets:
@@ -646,7 +769,8 @@ def main():
         # 阶段 3：全量统计
         monitor.report("全量统计分析", "running")
         frames = run_all_stats(chat_data, outputs["statistics"])
-        monitor.report("全量统计分析", "done", "已生成 {}".format(outputs["statistics"]))
+        monitor.report("全量统计分析", "done",
+                       "已生成 {}（每张工作表附带对应图表）".format(outputs["statistics"]))
 
         # 阶段 4：心理测评任务包
         monitor.report("生成心理测评任务包", "running")
